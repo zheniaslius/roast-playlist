@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import SpotifyWebApi from "spotify-web-api-node";
+import { openaiRateLimiter, burstRateLimiter } from "@/lib/rate-limiter";
+import { getClientIP } from "@/lib/utils";
+import {
+  RATE_LIMIT_CONFIG,
+  getRateLimitHeaders,
+} from "@/lib/rate-limiter-config";
 
 export async function POST(request: NextRequest) {
   try {
@@ -16,6 +22,43 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { error: "Invalid Spotify playlist URL" },
         { status: 400 }
+      );
+    }
+
+    // Rate limiting check
+    const clientIP = getClientIP(request);
+
+    // Check burst protection first
+    if (!burstRateLimiter.isAllowed(clientIP)) {
+      const remainingTime = Math.ceil(
+        (burstRateLimiter.getResetTime(clientIP) - Date.now()) / 1000
+      );
+      return NextResponse.json(
+        {
+          error: RATE_LIMIT_CONFIG.burst.message,
+          remainingTime: `${remainingTime} seconds`,
+          limit: `${RATE_LIMIT_CONFIG.burst.maxRequests} requests per ${
+            RATE_LIMIT_CONFIG.burst.windowMs / 1000
+          } seconds`,
+        },
+        { status: 429 }
+      );
+    }
+
+    // Check OpenAI API rate limit
+    if (!openaiRateLimiter.isAllowed(clientIP)) {
+      const remainingTime = Math.ceil(
+        (openaiRateLimiter.getResetTime(clientIP) - Date.now()) / 1000
+      );
+      return NextResponse.json(
+        {
+          error: RATE_LIMIT_CONFIG.openai.message,
+          remainingTime: `${remainingTime} seconds`,
+          limit: `${RATE_LIMIT_CONFIG.openai.maxRequests} requests per ${
+            RATE_LIMIT_CONFIG.openai.windowMs / 1000 / 60
+          } minutes`,
+        },
+        { status: 429 }
       );
     }
 
@@ -158,11 +201,19 @@ Original URL: ${spotifyUrl}`,
     const aiFeedback =
       data.choices[0]?.message?.content || "Unable to generate feedback";
 
-    return NextResponse.json({
+    const jsonResponse = NextResponse.json({
       feedback: aiFeedback,
       spotifyUrl: spotifyUrl,
       playlistData: playlistInfo,
     });
+
+    // Add rate limit headers
+    const rateLimitHeaders = getRateLimitHeaders(clientIP, openaiRateLimiter);
+    Object.entries(rateLimitHeaders).forEach(([key, value]) => {
+      jsonResponse.headers.set(key, value);
+    });
+
+    return jsonResponse;
   } catch (error) {
     console.error("Error processing AI feedback request:", error);
     return NextResponse.json(
